@@ -1,0 +1,293 @@
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+import numpy
+
+class GloVeFastDistances():
+
+    def __init__(self,gloveFile):
+        mod1 = SourceModule("""
+        __global__ void cosineSimilarity
+        (const unsigned int limit, const float* A, float* distanceOut,float* C_model,float* C_norms, const float normA) {
+            __shared__ float fastA[300];
+            const unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
+            if (threadIdx.x < 300) {
+                fastA[threadIdx.x] = A[threadIdx.x]; // only one embeding is on A
+            }
+            __syncthreads();
+            if (id < limit) {
+            
+                float acum = 0;
+                const unsigned int row = id / 8; // Get row
+                const unsigned int interiorId = threadIdx.x % 8;  // Get id within row
+                for (unsigned int i = interiorId; i < 300; i += 8) {
+                    acum += fastA[i]*C_model[row*300+i]; // Accumulate within the accumulator
+                }
+                acum += __shfl_down_sync(0xffffffff, acum, 4); // Reduction
+                acum += __shfl_down_sync(0xffffffff, acum, 2); // Reduction
+                acum += __shfl_down_sync(0xffffffff, acum, 1); // Reduction
+        
+                if (interiorId == 0) { // Final step and write results
+                    float simVal=(acum / (normA * C_norms[row]))+3;
+                    if (simVal>=4.0) simVal=3.999999762;
+                    distanceOut[row] = simVal;
+                }
+            }
+        }
+        
+        __global__ void radix
+        (const int limit, unsigned int* C, unsigned int* position, unsigned int* histogram) {
+            unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
+            if (id < limit) {
+                unsigned int current= C[id];
+                unsigned int mantissa= current & 0x007fffff;
+                unsigned int truePos=atomicAdd(&histogram[8388607-mantissa],1);
+                position[id]=truePos;
+            }
+        }
+        
+        __global__ void moveVector    
+        (const int limit, unsigned int *C,unsigned int *positionOffset, unsigned int *histogram,unsigned int *orderedPosition) {
+            unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
+            if (id<limit) {
+                unsigned int current= C[id];
+                unsigned int mantissa= current & 0x007fffff;
+        
+                unsigned int off=histogram[8388607-mantissa];
+                unsigned int realPosition=positionOffset[id]+off;
+                orderedPosition[realPosition]= id;
+            }
+        }
+        
+        
+        //Always reduces 8192 elements per block    
+        __global__ void blellochScan(int4 *g_idata,unsigned int *toScan) { 
+            __shared__ unsigned int temp[2111]; 
+            unsigned int thid = threadIdx.x; 
+            unsigned int blockOffset=blockIdx.x<<11;
+            unsigned int offset = 1;
+            
+            unsigned int aiGlobal = thid*2; 
+            unsigned int biGlobal = thid*2+1;
+        
+            unsigned int idGlobal = thid*2; 
+            int bankOffset = aiGlobal>>5; //To avoid memory bank conflicts, padding is added to shared
+            
+            int4 elem1=g_idata[idGlobal+blockOffset];
+            int4 elem2=g_idata[idGlobal+blockOffset+1];
+        
+            unsigned int a1=elem1.x;
+            unsigned int a2=elem1.y+a1;
+            unsigned int a3=elem1.z+a2;
+            unsigned int aSum=elem1.w+a3;
+            
+            unsigned int b1=elem2.x;
+            unsigned int b2=elem2.y+b1;
+            unsigned int b3=elem2.z+b2;
+            unsigned int bSum=elem2.w+b3;
+        
+            temp[aiGlobal+bankOffset] = aSum;
+            temp[biGlobal+bankOffset] = bSum; 
+        
+            for (int d = 1024; d > 0; d >>= 1) { // build sum in place up the tree  
+                __syncthreads();    
+                if (thid < d){ 
+                    unsigned int ai = offset*(2*thid+1)-1;   
+                    unsigned int bi = offset*(2*thid+2)-1; 
+                    ai+=ai>>5;
+                    bi+=bi>>5;
+                    temp[bi] += temp[ai]; 
+                    }
+                offset=offset<<1; 
+            }
+                
+            if (thid == 0) { 
+                toScan[blockIdx.x]=temp[2110];
+                temp[2110] = 0;
+            }
+            for (int d = 1; d < 2048; d *= 2) {
+                offset >>= 1;
+                __syncthreads();      
+                if (thid < d) { 
+                    unsigned int ai = offset*(2*thid+1)-1;     
+                    unsigned int bi = offset*(2*thid+2)-1; 
+                    ai+=ai>>5;
+                    bi+=bi>>5;
+                    unsigned int t = temp[ai]; 
+                    temp[ai] = temp[bi]; 
+                    temp[bi] += t;     
+                } 
+            }  
+            __syncthreads(); 
+            
+            unsigned int aux1=temp[aiGlobal+bankOffset];
+            unsigned int aux2=temp[biGlobal+bankOffset];
+            
+            elem1.x=aux1;
+            elem1.y=a1+aux1;
+            elem1.z=a2+aux1;
+            elem1.w=a3+aux1;
+        
+            elem2.x=aux2;
+            elem2.y=b1+aux2;
+            elem2.z=b2+aux2;
+            elem2.w=b3+aux2;
+        
+        
+            g_idata[idGlobal+blockOffset]=elem1;
+            g_idata[idGlobal+1+blockOffset]=elem2;
+        }
+        
+        __global__ void blellochScanSmall(int4 *g_idata) { 
+            __shared__ unsigned int temp[263]; 
+            unsigned int thid = threadIdx.x; 
+            unsigned int offset = 1;
+            
+            unsigned int aiGlobal = thid*2; 
+            unsigned int biGlobal = thid*2+1;
+        
+            unsigned int idGlobal = thid*2; 
+            int bankOffset = aiGlobal>>5; //To avoid memory bank conflicts, padding is added to shared
+            
+            int4 elem1=g_idata[idGlobal];
+            int4 elem2=g_idata[idGlobal+1];
+        
+            unsigned int a1=elem1.x;
+            unsigned int a2=elem1.y+a1;
+            unsigned int a3=elem1.z+a2;
+            unsigned int aSum=elem1.w+a3;
+            
+            unsigned int b1=elem2.x;
+            unsigned int b2=elem2.y+b1;
+            unsigned int b3=elem2.z+b2;
+            unsigned int bSum=elem2.w+b3;
+        
+            temp[aiGlobal+bankOffset] = aSum;
+            temp[biGlobal+bankOffset] = bSum; 
+        
+            for (int d = 128; d > 0; d >>= 1) { // build sum in place up the tree  
+                __syncthreads();    
+                if (thid < d){ 
+                    unsigned int ai = offset*(2*thid+1)-1;   
+                    unsigned int bi = offset*(2*thid+2)-1; 
+                    ai+=ai>>5;
+                    bi+=bi>>5;
+                    temp[bi] += temp[ai]; 
+                    }
+                offset=offset<<1; 
+            }
+                
+            if (thid == 0) { 
+                temp[262] = 0;
+            }
+            for (int d = 1; d < 256; d *= 2) {
+                offset >>= 1;
+                __syncthreads();      
+                if (thid < d) { 
+                    unsigned int ai = offset*(2*thid+1)-1;     
+                    unsigned int bi = offset*(2*thid+2)-1; 
+                    ai+=ai>>5;
+                    bi+=bi>>5;
+                    unsigned int t = temp[ai]; 
+                    temp[ai] = temp[bi]; 
+                    temp[bi] += t;     
+                } 
+            }  
+            __syncthreads(); 
+            
+            unsigned int aux1=temp[aiGlobal+bankOffset];
+            unsigned int aux2=temp[biGlobal+bankOffset];
+            
+            elem1.x=aux1;
+            elem1.y=a1+aux1;
+            elem1.z=a2+aux1;
+            elem1.w=a3+aux1;
+        
+            elem2.x=aux2;
+            elem2.y=b1+aux2;
+            elem2.z=b2+aux2;
+            elem2.w=b3+aux2;
+        
+        
+            g_idata[idGlobal]=elem1;
+            g_idata[idGlobal+1]=elem2;
+        
+        }
+        
+        
+        __global__ void addBlock(unsigned int *g_idata,unsigned int *toAdd) { 
+            unsigned int id=blockIdx.x*blockDim.x+threadIdx.x;
+            g_idata[id]+=toAdd[blockIdx.x/8];
+        }        
+         """)
+
+        self.cosineSimilarity = mod1.get_function("cosineSimilarity")
+        self.radix = mod1.get_function("radix")
+        self.moveVector = mod1.get_function("moveVector")
+        self.blellochScan = mod1.get_function("blellochScan")
+        self.blellochScanSmall = mod1.get_function("blellochScanSmall")
+        self.addBlock = mod1.get_function("addBlock")
+
+        #All this overhead can be removed by using binary files already ordered, but is kept for portability
+        f = open(gloveFile, 'r')
+        model = {}
+        for line in f:
+            splitLine = line.split(' ')
+            word = splitLine[0]
+            embedding = numpy.array([float(val) for val in splitLine[1:]])
+            model[word] = embedding
+        self.embeddings=[]
+        self.wordDictionary={}
+        self.inverseWordDictionary={}
+        norms=[]
+        for idx,key in enumerate(sorted(model)):
+            self.embeddings.append(model[key])
+            norms.append(numpy.linalg.norm(model[key]))
+            self.wordDictionary[key]=idx
+            self.inverseWordDictionary[idx]=key
+        self.embeddings=numpy.array(self.embeddings,dtype=numpy.float32)
+        norms=numpy.array(norms,dtype=numpy.float32)
+
+        self.c_model_gpu = cuda.mem_alloc(self.embeddings.nbytes)
+        self.c_norms_gpu = cuda.mem_alloc(norms.nbytes)
+        self.pos_gpu=cuda.mem_alloc(norms.nbytes)
+        self.upsweep_gpu=cuda.mem_alloc((2**12)*4)
+        self.finalUpsweep_gpu=cuda.mem_alloc(2*4)
+        self.distance_gpu= cuda.mem_alloc(norms.nbytes)
+        self.a_gpu = cuda.mem_alloc(300*4)
+        self.orderedPosition_gpu = cuda.mem_alloc(norms.nbytes)
+        self.histogram_gpu = cuda.mem_alloc(4*(2**23))
+        cuda.memcpy_htod(self.c_model_gpu, self.embeddings)
+        cuda.memcpy_htod(self.c_norms_gpu, norms)
+        self.rows=len(norms)
+        self.pos = numpy.zeros(self.rows,dtype=numpy.uint32)
+        self.gridDot = ((self.rows // 64) + 1, 1)
+        self.blockDot = (512, 1, 1)
+        self.gridRows = ((self.rows // 512) + 1, 1)
+        self.blockRows = (512, 1, 1)
+        self.gridBlock = (1024, 1)
+        self.blockBlock = (1024, 1, 1)
+        self.gridSum = (8192, 1)
+        self.gridReduce = (1, 1)
+        self.blockReduce = (128, 1, 1)
+        self.cosineSimilarity.prepare(("I", "P", "P", "P", "P", "F"))
+        self.radix.prepare(("I", "P", "P", "P"))
+        self.moveVector.prepare(("I", "P", "P", "P", "P"))
+        self.blellochScan.prepare(("P", "P"))
+        self.blellochScanSmall.prepare(("P"))
+        self.addBlock.prepare(("P", "P"))
+
+    def getSimilarWord(self,word):
+        word=numpy.float32(word)
+        norm=numpy.linalg.norm(word)
+        cuda.memcpy_htod(self.a_gpu, word)
+        cuda.memset_d32(self.histogram_gpu, 0, 2 ** 23)
+        self.cosineSimilarity.prepared_call(self.gridDot, self.blockDot, self.rows * 8, self.a_gpu, self.distance_gpu, self.c_model_gpu, self.c_norms_gpu,norm)
+        self.radix.prepared_call(self.gridRows, self.blockRows, self.rows, self.distance_gpu, self.pos_gpu, self.histogram_gpu)
+        self.blellochScan.prepared_call(self.gridBlock, self.blockBlock, self.histogram_gpu, self.upsweep_gpu)
+        self.blellochScanSmall.prepared_call(self.gridReduce, self.blockReduce, self.upsweep_gpu)
+        self.addBlock.prepared_call(self.gridSum, self.blockBlock, self.histogram_gpu, self.upsweep_gpu)
+        self.moveVector.prepared_call(self.gridRows, self.blockRows, self.rows, self.distance_gpu, self.pos_gpu, self.histogram_gpu, self.orderedPosition_gpu)
+        cuda.memcpy_dtoh(self.pos, self.orderedPosition_gpu)
+
+
